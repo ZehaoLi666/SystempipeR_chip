@@ -1,4 +1,3 @@
-A
 ---
 title: "ChIP-Seq data analysis workflow and report"
 author: "Author: Zehao Li"
