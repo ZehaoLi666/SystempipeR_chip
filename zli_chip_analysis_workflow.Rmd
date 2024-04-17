@@ -1,0 +1,530 @@
+A
+---
+title: "ChIP-Seq data analysis workflow and report"
+author: "Author: Zehao Li"
+date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+    code_folding: show
+package: systemPipeR
+vignette: |
+  %\VignetteEncoding{UTF-8}
+  %\VignetteIndexEntry{WF: ChIP-Seq Workflow Template}
+  %\VignetteEngine{knitr::rmarkdown}
+fontsize: 14pt
+bibliography: bibtex.bib
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction 
+This workflow can allow you to generate read counts file mapping to the genome. 
+For Normalization, substraction of background and transfermation to tdf file, you need to do it separately. 
+
+# Before you run the workflow 
+Before running the workflow, upload targets.txt file to root directory and genome.fasta file and genome.gff file to ./data directory. 
+Remember to change your genome.fasta file name to genome, genome.gff file name to genome.gff. 
+
+# Generate a workflow to do alignment
+
+## Create a Project 
+```{r create_workflow, message=FALSE, eval=FALSE}
+library(systemPipeR)
+sal <- SPRproject(overwrite = TRUE)
+sal <- SPRproject(restart = TRUE)
+sal
+```
+
+## Required packages and resources 
+```{r load_SPR, message=FALSE, eval=FALSE, spr=TRUE}
+appendStep(sal) <- LineWise(code = {
+                            library(systemPipeR)
+                            }, step_name = "load_SPR")
+```
+
+## Read preprocessing 
+### FASTQ quality report 
+```{r fastq_report, eval=FALSE, message=FALSE, spr=TRUE}
+appendStep(sal) <- LineWise(
+    code = {
+        targets <- read.delim("targets_PE.txt", comment.char = "#")
+        updateColumn(sal, step = "load_SPR", position = "targetsWF") <- targets
+        fq_files <- getColumn(sal, "load_SPR", "targetsWF", column = 1)
+        fqlist <- seeFastq(fastq = fq_files, batchsize = 10000, klength = 8)
+        png("./results/fastqReport.png", height = 162, width = 288 * length(fqlist))
+        seeFastqPlot(fqlist)
+        dev.off()
+    },
+    step_name = "fastq_report",
+    dependency = "load_SPR"
+)
+```
+### trimmomatic (recommended if the sequencing data is from illumina platform) 
+```{r Trimmomatic, message=FALSE, eval=FALSE, spr=TRUE}
+appendStep(sal) <- SYSargsList(
+                               step_name = "trimmomatic",
+                               targets = "~/lab/chip-seq/chipseq/targets_PE.txt", dir = TRUE,
+                               wf_file = "trimmomatic/trimmomatic-pe.cwl",
+                               input_file = "trimmomatic/trimmomatic-pe.yml",
+                               dir_path = "~/lab/chip-seq/chipseq/param/cwl",
+                               inputvars = c(
+                                             FileName1 = "_FASTQ_PATH1_",
+                                             FileName2 = "_FASTQ_PATH2_",
+                                             SampleName = "_SampleName_"
+                                             ),
+                               dependency = c("fastq_report")
+                               )
+
+cmdlist(sal, "trimmomatic", targets = 1)
+```
+
+
+### Preprocessing with `preprocessReads` function (Optional, only if you need to customize the adaptar, quality and length trimming parameters)
+
+```{r preprocessing, message=FALSE, eval=FALSE, spr=TRUE}
+appendStep(sal) <- SYSargsList(
+    step_name = "preprocessing",
+    targets = "targets_PE.txt", dir = TRUE,
+    wf_file = "preprocessReads/preprocessReads-pe.cwl",
+    input_file = "preprocessReads/preprocessReads-pe.yml",
+    dir_path = system.file("extdata/cwl", package = "systemPipeR"),
+    inputvars = c(
+        FileName1 = "_FASTQ_PATH1_",
+        FileName2 = "_FASTQ_PATH2_",
+        SampleName = "_SampleName_"
+    ),
+    dependency = c("fastq_report")
+)
+```
+
+```{r custom_preprocessing_function, eval=FALSE}
+appendStep(sal) <- LineWise(
+    code = {
+        filterFct <- function(fq, cutoff = 20, Nexceptions = 0) {
+            qcount <- rowSums(as(quality(fq), "matrix") <= cutoff, na.rm = TRUE)
+            # Retains reads where Phred scores are >= cutoff with N exceptions
+            fq[qcount <= Nexceptions]
+        }
+        save(list = ls(), file = "param/customFCT.RData")
+    },
+    step_name = "custom_preprocessing_function",
+    dependency = "preprocessing"
+)
+```
+
+After, we can edit the input parameter:
+```{r editing_preprocessing, message=FALSE, eval=FALSE}
+yamlinput(sal, "preprocessing")$Fct
+yamlinput(sal, "preprocessing", "Fct") <- "'filterFct(fq, cutoff=20, Nexceptions=0)'"
+yamlinput(sal, "preprocessing")$Fct ## check the new function
+cmdlist(sal, "preprocessing", targets = 1) ## check if the command line was updated with success
+```
+
+## Alignments
+
+### Read mapping with `Bowtie2`
+
+The NGS reads of this project will be aligned with `Bowtie2` against the
+reference genome sequence [@Langmead2012-bs]. The parameter settings of the
+Bowtie2 index are defined in the `bowtie2-index.cwl` and `bowtie2-index.yml` files.
+
+Building the index:
+
+```{r bowtie2_index, eval=FALSE, spr=TRUE}
+appendStep(sal) <- SYSargsList(
+    step_name = "bowtie2_index",
+    dir = FALSE, targets = NULL,
+    wf_file = "bowtie2/bowtie2-index.cwl",
+    input_file = "bowtie2/bowtie2-index.yml",
+    dir_path = "~/lab/chip-seq/chipseq/param/cwl",
+    inputvars = NULL,
+    #dependency = c("preprocessing")
+)
+
+cmdlist(sal, step="bowtie2_index")
+```
+```{r targets_bowtie2, eval=FALSE}
+appendStep(sal) <- LineWise(
+    code = {
+        targets <- read.delim("targets_PE.txt", comment.char = "#")
+        # change the first column to the path: results/Trimmomatic and the file name is SampleName+_1P.trimmed.fastq.gz
+        targets$FileName1 <- paste0("./results/Trimmomatic/", targets$SampleName, "_1P.trimmed.fastq.gz")
+        # change the second column to the path: results/Trimmomatic and the file name is SampleName+_2P.trimmed.fastq.gz
+        targets$FileName2 <- paste0("./results/Trimmomatic/", targets$SampleName, "_2P.trimmed.fastq.gz")
+        # write the new targets file
+         write.table(targets, "targetsPE_bowtie2.txt", quote=FALSE, row.names=FALSE, sep="\t")
+
+    }, 
+    step_name = "targets_bowtie2", 
+    dependency = "trimmomatic")
+```
+
+```{r bowtie2_alignment, eval=FALSE, spr=TRUE}
+appendStep(sal) <- SYSargsList(
+    step_name = "bowtie2_alignment",
+    dir = TRUE,
+    targets = "targetsPE_bowtie2.txt",    # change the targets, if you used the preprocessReads function
+    wf_file = "workflow-bowtie2/workflow_bowtie2-pe.cwl",
+    input_file = "workflow-bowtie2/workflow_bowtie2-pe.yml",
+    dir_path = "param/cwl",
+    inputvars = c(
+        FileName1 = "_FASTQ_PATH1_",
+        FileName2 = "_FASTQ_PATH2_",
+        SampleName = "_SampleName_"
+    ),
+    dependency = c("bowtie2_index")
+)
+```
+
+To double-check the command line for each sample, please use the following:
+
+```{r bowtie2_alignment_check, eval=FALSE}
+cmdlist(sal, step="bowtie2_alignment", targets=1)
+```
+
+### Read and alignment stats
+
+The following provides an overview of the number of reads in each sample
+and how many of them aligned to the reference.
+
+```{r align_stats_1, eval=FALSE, spr=TRUE}
+appendStep(sal) <- LineWise(
+    code = {
+        fqpaths <- getColumn(sal, step = "bowtie2_alignment", "targetsWF", column = "FileName1")
+        bampaths <- getColumn(sal, step = "bowtie2_alignment", "outfiles", column = "samtools_sort_bam")
+        read_statsDF <- alignStats(args = bampaths, fqpaths = fqpaths, pairEnd = TRUE)
+        write.table(read_statsDF, "results/alignStats.xls", row.names=FALSE, quote=FALSE, sep="\t")
+        },
+    step_name = "align_stats",
+    dependency = "bowtie2_alignment")
+```
+### merge the bam file (optional, only if you have replicates and want to merge them)
+```{r merge_bams, eval=FALSE, spr=TRUE}
+appendStep(sal) <- LineWise(
+    code = {
+        bampaths <- getColumn(sal, step = "bowtie2_alignment", "outfiles", column = "samtools_sort_bam")
+        merge_bams <- mergeBamByFactor(args=bampaths, targetsDF = targetsWF(sal)[["bowtie2_alignment"]], out_dir = file.path("results", "merge_bam") ,overwrite=TRUE)
+        updateColumn(sal, step = "merge_bams", position = "targetsWF") <- merge_bams
+        merge_bams$SampleName <- merge_bams$Factor
+        write.table(merge_bams, "targets_merge_bams.txt", col.name=TRUE, row.name=FALSE, quote=FALSE, sep="\t")
+    },
+    step_name = "merge_bams",
+    dependency = "bowtie2_alignment"
+)
+```
+### Generate alignment stats for merged BAM files (optional)
+```{r align_stats_2, eval=FALSE, spr=TRUE}
+appendStep(sal) <- LineWise(
+    code = {
+        # read the targets_PE.txt file 
+        targets <- read.delim("targets_PE.txt", comment.char = "#")
+        # read the results/alignStats.xls
+        read_statsDF <- read.table("results/alignStats.xls", header = TRUE, sep = "\t")
+        read_statsDF$Factor <- targets$Factor
+        # add up the number of Nreads2x and Nalign according to the Factor 
+        read_statsDF <- aggregate(read_statsDF[, c("Nreads2x", "Nalign")], by = list(read_statsDF$Factor), FUN = sum)
+        # write the new file to results/alignStats_2.xls
+        write.table(read_statsDF, "results/alignStats_2.xls", row.names = FALSE, quote = FALSE, sep = "\t")
+    },
+    
+    
+)
+
+
+
+## Create reads count file mapping to the genome 
+### Filter out reads to rRNA genes
+rRNA genes are highly expressed and can account for a large proportion of sequencing reads,
+which can reduce the effective sequencing depth for other genomic regions of interest.
+```{r rRNA_bed, eval=FALSE, spr=TRUE}
+
+appendStep(sal) <-  LineWise(
+                             code = {
+
+                gff_data <- readLines("~/lab/chip-seq/chipseq/data/genome.gff")
+                rRNA_lines <- grep("\trRNA\t", gff_data, value = TRUE)
+                writeLines(rRNA_lines, "~/lab/chip-seq/chipseq/data/rRNA.bed")},
+                step_name= "create_rRNA_bed_file")
+
+```
+
+```{r filter_rRNA, eval=FALSE, spr=TRUE}
+appendStep(sal) <- SYSargsList(step_name = "filter_rRNA",
+                               dir=TRUE,
+                               targets="targets_merge_bams.txt",
+                               wf_file="filter_rRNA/filter_rRNA.cwl",
+                               input_file="filter_rRNA/filter_rRNA.yml",
+                               dir_path="param/cwl",
+                               inputvars = c(SampleName = "_SampleName_"),
+                               )
+```
+
+```{r sdfsd, }
+cmdlist(sal, step="filter_rRNA")
+```
+
+
+### Keep only properly paired reads
+ChIP-seq experiments typically involve sequencing DNA fragments that have been immunoprecipitated with a specific antibody,
+followed by mapping the resulting sequencing reads to the reference genome.
+The immunoprecipitation process can introduce biases in the sequencing library preparation, leading to non-specific binding,
+PCR amplification artifacts, and other sources of noise.
+
+Filtering out improperly paired reads can help to reduce the effects of these biases and improve the accuracy of downstream analyses.
+Improperly paired reads are reads where one or both reads in a paired-end sequencing experiment do not align as expected based on the insert size distribution,
+indicating that the read pair is likely to be a PCR artifact or other source of noise.
+
+
+```{r keep_proper_reads, eval=FALSE, spr=TRUE}
+appendStep(sal) <- SYSargsList(step_name = "properly_paired_reads",
+                               dir=TRUE,
+                               targets="filter_rRNA",
+                               wf_file="properly_paired_reads/properly_paired_reads.cwl",
+                               input_file="properly_paired_reads/properly_paired_reads.yml",
+                               dir_path="param/cwl",
+                               inputvars = c(SampleName = "_SampleName_"),
+                               dependency=c("filter_rRNA"))
+cmdlist(sal, step="properly_paired_reads")
+```
+
+### Generate genome index file for bedtools
+```{r Ref_genome_index, eval=FALSE, spr=TRUE}
+appendStep(sal) <- LineWise(
+    code = {
+                system("module load samtools
+                       samtools faidx ~/lab/chip-seq/chipseq/data/genome")
+           },
+            step_name = "Ref_genome_index")
+```
+
+### Convert BAM to BED file
+```{r BAMtoBED, eval=FALSE, spr=TRUE}
+appendStep(sal) <- SYSargsList(step_name = "BAMtoBED",
+                               dir=TRUE,
+                               targets="properly_paired_reads",
+                               wf_file="visualization/BAMtoBED.cwl",
+                               input_file="visualization/BAMtoBED.yml",
+                               dir_path="param/cwl",
+                               inputvars = c(SampleName = "_SampleName_"),
+                               dependency=c("properly_paired_reads"))
+
+cmdlist(sal, step="BAMtoBED")
+```
+
+### Get read count per nucleotide in the genome
+```{r Read_counts, eval=FALSE, spr=TRUE}
+appendStep(sal) <- SYSargsList(step_name = "Read_counts",
+                                dir=TRUE,
+                                targets="BAMtoBED",
+                                wf_file="visualization/Read_counts.cwl",
+                                input_file="visualization/Read_counts.yml",
+                                dir_path="param/cwl",
+                                inputvars = c(SampleName = "_SampleName_"),
+                                dependency=c("BAMtoBED"))
+cmdlist(sal, step="Read_counts")
+```
+
+# Run the workflow 
+## Set up resources to run the workflow on parallele
+```{r runWF_cluster, eval=FALSE}
+resources <- list(conffile=".batchtools.conf.R",
+                  template="batchtools.slurm.tmpl",
+                  Njobs=80,
+                  walltime=2400, ## minutes
+                  ntasks=1,
+                  ncpus=1,
+                  memory=10240, ## Mb
+                  partition = "batch"
+                  )
+sal <- addResources(sal, c("fastq_report","trimmomatic",
+                           "bowtie2_alignment","align_stats","merge_bams"), resources = resources)
+sal <- runWF(sal)
+
+```
+
+# Downstream analysis of visualizing in IGV 
+## Normalization 
+```{r align_stats_2, eval=FALSE, spr=TRUE}
+appendStep(sal) <- LineWise(code = {
+    fqpaths2 <- getColumn(sal, step = "properly_paired_reads", "targetsWF",
+        column = "FileName1")
+    bampaths2 <- getColumn(sal, step = "properly_paired_reads", "outfiles")
+    read_statsDF2 <- alignStats(args = bampaths2, fqpaths = fqpaths2,
+        pairEnd = TRUE)
+    write.table(read_statsDF2, "results/alignStats_2.xls", row.names = FALSE,
+        quote = FALSE, sep = "\t")
+}, step_name = "align_stats_2", dependency = "properly_paired_reads")
+
+```
+```{r normalization, eval=FALSE, spr=TRUE}
+appendStep(sal) <- LineWise(code = {
+
+
+    input_col1 <- c() 
+    output_col2 <- c()
+    MMR_number_col3 <- c()
+    for (i in 1:nrow(read_statsDF2)){
+        filename1 <- paste0("results/Read_counts/",read_statsDF2[i,]$FileName,".readsCount.txt") 
+        input_col1 <- append(input_col1,filename1)
+        
+        filename2 <- paste0(read_statsDF2[i,]$FileName,".normalizated")
+        output_col2 <- append(output_col2,filename2)
+
+        number <- read_statsDF2[i,]$Nalign / 1000000
+        MMR_number_col3 <- append(MMR_number_col3,number)}
+    
+
+    
+    read_counts_DF <- data.frame(Column1 = input_col1,Column2 = output_col2, Column3 = MMR_number_col3)
+    
+
+
+    for (i in 1:nrow(read_counts_DF)){
+        
+        input_filename <- read_counts_DF[i,1]
+        output_filename <- read_counts_DF[i,2] 
+        MMR_number <- read_counts_DF[i,3]
+        cat("Processing input file:", input_filename, "\n")
+        new_dataframe <- data.frame()
+        new_dataframe <- read.table(input_filename, header = FALSE)
+        new_dataframe[,3] <- round(new_dataframe[,3]/MMR_number,3)
+        write.table(new_dataframe, paste0("~/lab/chip-seq/chipseq/results/",output_filename,".txt"), sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+    }
+    
+}, step_name="normalization", dependency = "align_stats_2")
+```
+
+## Substraction of background 
+```{r Substraction,  eval=FALSE, spr=TRUE}
+### import files 
+treatment1 <- read.table("./results/S12.normalizated.txt", header=FALSE)
+treatment2 <- read.table("./results/S13.normalizated.txt", header=FALSE)
+treatment3 <- read.table("./results/S14.normalizated.txt", header=FALSE)
+input <- read.table("./results/S15.normalizated.txt", header=FALSE) 
+
+### combined files 
+combine_T1_input <- cbind(treatment3, input$V3)
+
+### Calculate the difference of read counts between the treat and control and generate column5 in combinded data frame
+combine_T1_input$V5 <- combine_T1_input$V3 - combine_T1_input$'input$V3'
+
+### remove column3 and column4 in the combinded data frame
+combine_T1_input$V3 <- NULL 
+combine_T1_input$'input$V3' <- NULL 
+
+### write the output to a new file
+write.table(combine_T1_input, file='./results/S14_HA.txt',
+            sep="\t", row.names=FALSE, col.names=FALSE, quote=FALSE)
+```
+
+
+
+## Transfer files to TDF file 
+```{r make_wig_file, eval=FALSE, spr=TRUE}
+system("python make_wig_from_nucleotide_coverage.py  ./results/S16_HA.txt  ./results/S16.wig")
+system("python make_wig_from_nucleotide_coverage.py  ./results/S17_HA.txt  ./results/S17.wig")
+system("python make_wig_from_nucleotide_coverage.py  ./results/S18_IGG.txt  ./results/S18.wig")
+
+
+
+system("module load igv 
+       igvtools toTDF ./results/S12.wig ./results/S12.tdf ./data/genome.fai")
+system("module load igv 
+       igvtools toTDF ./results/S13.wig ./results/S13.tdf ./data/genome.fai")
+
+system("module load igv
+       igvtools toTDF ./results/S14.wig ./results/S14.tdf ./data/genome.fai")
+
+```
+
+
+
+# Down stream analysis 
+
+## Peak Calling 
+
+### Merge BAM files of replicates prior to peak calling (Optional)
+Merging BAM files of technical and/or biological replicates 
+can improve the sensitivity of the peak calling by increasing the depth of read coverage.
+ The mergeBamByFactor function merges BAM files based on grouping information specified by a factor, 
+ here the Factor column of the imported targets file.
+ It also returns an updated targets object containing the paths to the merged BAM files as well as to any unmerged files without replicates.
+ The updated targets object can be used to update the SYSargsList object.
+```{r merge_bams, eval=FALSE, spr=TRUE}
+appendStep(sal) <- LineWise(code = {
+    bampaths <- getColumn(sal, step = "properly_paired_reads", "outfiles")
+    merge_bams <- mergeBamByFactor(args = bampaths, targetsDF = targetsWF(sal)[["properly_paired_reads"]],
+        overwrite = TRUE)
+    updateColumn(sal, step = "merge_bams", position = "targetsWF") <- merge_bams
+    writeTargets(sal, step = "merge_bams", file = "targets_merge_bams.txt",
+        overwrite = TRUE)
+}, step_name = "merge_bams", dependency = "properly_paired_reads")
+
+```
+
+### Peak calling with input/reference sample
+MACS2 can perform peak calling on ChIP-Seq data with and without input samples (Zhang et al. 2008).
+The following performs peak calling with input sample.
+The input sample can be most conveniently specified in the SampleReference column of the initial targets file.
+The writeTargetsRef function uses this information to create a targets file intermediate for running MACS2 with the corresponding input sample(s).
+```{r writeTargetsRef, eval=FALSE, spr=TRUE}
+appendStep(sal) <- LineWise(code = {
+    writeTargetsRef(infile = "targets_merge_bams.txt", outfile = "targets_bam_ref.txt",
+        silent = FALSE, overwrite = TRUE)
+}, step_name = "writeTargetsRef", dependency = "merge_bams")
+```
+
+```{r call_peaks_macs_withref, eval=FALSE, spr=TRUE}
+appendStep(sal) <- SYSargsList(step_name = "call_peaks_macs_withref",
+    targets = "target_bam_ref.txt", wf_file = "MACS2/macs2-input.cwl",
+    input_file = "MACS2/macs2-input.yml", dir_path = "param/cwl",
+    inputvars = c(FileName1 = "_FASTQ_PATH1_", FileName2 = "_FASTQ_PATH2_",
+        SampleReference = "_SampleName_"), id = "SampleReference")
+
+cmdlist(sal, step = "call_peaks_macs_withref", targets = 1)
+
+```
+### Annotate peaks with genomic context
+Annotation with ChIPseeker package
+
+```{r Annotation_with_ChIPseeker_package, eval=FALSE, spr=TRUE}
+appendStep(sal) <- LineWise(code = {
+    library(ChIPseeker)
+    library(GenomicFeatures)
+    peaks_files <- getColumn(sal, step = "call_peaks_macs_withref",
+        "outfiles", column = "peaks_xls")
+    txdb <- suppressWarnings(makeTxDbFromGFF(file = "data/genome.gff",
+        format = "gff"))
+    for (i in seq(along = peaks_files)) {
+        peakAnno <- annotatePeak(peaks_files[i], TxDb = txdb,
+            verbose = FALSE)
+        df <- as.data.frame(peakAnno)
+        outpaths <- paste0("./results/", names(peaks_files),
+            "_ChIPseeker_annotated.xls")
+        names(outpaths) <- names(peaks_files)
+        write.table(df, outpaths[i], quote = FALSE, row.names = FALSE,
+            sep = "\t")
+    }
+    updateColumn(sal, step = "annotation_ChIPseeker", position = "outfiles") <- data.frame(outpaths)
+}, step_name = "annotation_ChIPseeker", dependency = "call_peaks_macs_withref")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
